@@ -1,18 +1,17 @@
 use std::env;
+use std::error::Error;
+use tokio::net::UdpSocket;
+use std::net::SocketAddr;
 
-mod torrent;
-mod tracker;
+mod crawler;
+mod protocol;
 
-fn main () {
-    let args: Vec<String> = env::args().collect();
-
-    let magnet = &args[1];
-    let mut torrent = torrent::Torrent::new();
-    if Ok(()) == torrent.from_magnet(magnet) {
-        println!("{:?}", torrent)
-    }
-
-    let trackers = torrent.get_trackers().unwrap();
-    let first_tracker = tracker::Tracker::new(&trackers[0]);
-    first_tracker.connect();
+#[tokio::main]
+async fn main () -> Result<(), Box<dyn Error>> {
+    let local_addr: SocketAddr = "0.0.0.0:0".parse()?;
+    let socket = UdpSocket::bind(local_addr).await?;
+    let mut c = crawler::Crawler::new(vec![String::from("82.221.103.244:6881")], socket);
+    c.start().await?;
+    println!("{:?}", c);
+    Ok(())
 }
