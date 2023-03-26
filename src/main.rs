@@ -3,22 +3,21 @@ use futures::FutureExt;
 use log::{error, trace, warn};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use serde_bencode::value::Value;
+
 use serde_bencode::{from_bytes, to_bytes};
-use tokio::sync::{Mutex, oneshot};
 use std::collections::HashMap;
-use std::default;
-use std::future::Future;
-use std::net::{SocketAddr, Ipv4Addr, IpAddr, Ipv6Addr};
-use std::pin::Pin;
+use tokio::sync::{oneshot, Mutex};
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use std::convert::TryInto;
 use std::sync::Arc;
 use tokio::net::lookup_host;
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, Duration};
-use std::convert::TryInto;
 
 mod dht;
-use dht::{DHT, Node, NodeId};
+use dht::{Node, NodeId, DHT};
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
 pub enum MessageType {
@@ -42,14 +41,14 @@ pub enum DhtQuery {
 pub struct DhtMessage {
     #[serde(with = "serde_bytes")]
     #[serde(default)]
-    pub t: Vec<u8>, 
+    pub t: Vec<u8>,
     #[serde(default)]
-    pub y: MessageType,   
-    #[serde(default)]    
-    pub q: Option<String>, 
-    #[serde(default)]      
-    pub a: Option<Args>,     
-    #[serde(default)] 
+    pub y: MessageType,
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub a: Option<Args>,
+    #[serde(default)]
     pub r: Option<ReturnValues>,
     #[serde(default)]
     pub e: Option<Error>,
@@ -58,12 +57,10 @@ pub struct DhtMessage {
 impl DhtMessage {
     pub fn new(_type: MessageType) -> Self {
         let mut rng = rand::thread_rng();
-        let t: Vec<u8> = (0..2)
-            .map(|_| rng.gen_range(0..=255))
-            .collect();
+        let t: Vec<u8> = (0..2).map(|_| rng.gen_range(0..=255)).collect();
 
         DhtMessage {
-            t: t,
+            t,
             y: _type,
             q: None,
             a: None,
@@ -90,7 +87,7 @@ impl DhtMessage {
                     a.id = "abcdefghij0123456789".as_bytes().to_vec();
                     a
                 })
-            },
+            }
             DhtQuery::FindNode(node) => {
                 self.q = Some("find_node".to_string());
                 self.a = Some({
@@ -99,7 +96,7 @@ impl DhtMessage {
                     a.target = Some(node.0);
                     a
                 })
-            },
+            }
             DhtQuery::GetPeers(_) => self.q = Some("get_peers".to_string()),
             DhtQuery::AnnouncePeer(_, _, _) => self.q = Some("announce_peer".to_string()),
         }
@@ -176,55 +173,68 @@ struct Crawler {
 impl Crawler {
     fn new(socket: UdpSocket) -> Self {
         let local_id = NodeId::new();
-        Crawler { dht: Arc::new(Mutex::new(DHT::new(local_id.clone(), 20, 160))), socket: Arc::new(socket), pending_requests: Arc::new(Mutex::new(HashMap::new())), local_id }
+        Crawler {
+            dht: Arc::new(Mutex::new(DHT::new(local_id.clone(), 20, 160))),
+            socket: Arc::new(socket),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            local_id,
+        }
     }
 
-    async fn send_message(&mut self, message: &DhtMessage, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    async fn send_message(
+        &mut self,
+        message: &DhtMessage,
+        addr: SocketAddr,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let encoded_msg = to_bytes(&message).unwrap();
         self.socket.send_to(&encoded_msg, &addr).await?;
         Ok(())
     }
 
-    async fn send_request_and_wait_for_response(&mut self, request: DhtMessage, addr: SocketAddr) -> Result<DhtMessage, Box<dyn std::error::Error>> {
+    async fn send_request_and_wait_for_response(
+        &mut self,
+        request: DhtMessage,
+        addr: SocketAddr,
+    ) -> Result<DhtMessage, Box<dyn std::error::Error>> {
         self.send_message(&request, addr).await?;
 
         let (response_sender, response_receiver) = oneshot::channel();
-        self.pending_requests.lock().await.insert(request.t.clone(), response_sender);
-        let response = match tokio::time::timeout(Duration::from_secs(5), response_receiver).await? {
+        self.pending_requests
+            .lock()
+            .await
+            .insert(request.t.clone(), response_sender);
+        let response = match tokio::time::timeout(Duration::from_secs(5), response_receiver).await?
+        {
             Ok(response) => response,
             Err(_) => {
-                self.pending_requests.lock().await.remove(&request.t.clone());
+                self.pending_requests
+                    .lock()
+                    .await
+                    .remove(&request.t.clone());
                 return Err("Request timed out".into());
             }
         };
-        self.pending_requests.lock().await.remove(&request.t.clone());
-    
+        self.pending_requests
+            .lock()
+            .await
+            .remove(&request.t.clone());
+
         Ok(response)
     }
 
     async fn process_responses(&self) {
         let mut buf = [0u8; 1024];
-    
+
         loop {
             let (size, src) = self.socket.recv_from(&mut buf).await.unwrap();
             let msg = match from_bytes::<DhtMessage>(&buf[..size]) {
-                Ok(msg) => {
-                    msg
-                },
+                Ok(msg) => msg,
                 Err(e) => {
                     error!("{}", e);
                     continue;
                 }
             };
 
-            // let t = match msg.t.clone() {
-            //     Some(t) => t,
-            //     None => {
-            //         self.handle_message(msg, src).await;
-            //         continue;
-            //     }
-            // };
-    
             if let Some(response_sender) = self.pending_requests.lock().await.remove(&msg.t) {
                 let _ = response_sender.send(msg);
             } else {
@@ -233,7 +243,7 @@ impl Crawler {
         }
     }
 
-    async fn insert_node (&mut self, node: Node) {
+    async fn insert_node(&mut self, node: Node) {
         self.dht.lock().await.insert(node);
     }
 
@@ -243,7 +253,7 @@ impl Crawler {
                 if let Some(r) = msg.r {
                     trace!("Response: {:?}", r);
                 }
-            },
+            }
             MessageType::Query => {
                 if let Some(q) = msg.q {
                     match q.as_str() {
@@ -253,16 +263,16 @@ impl Crawler {
                                 .build();
                             let encoded_msg = to_bytes(&response).unwrap();
                             self.socket.send_to(&encoded_msg, &origin).await.unwrap();
-                        },
+                        }
                         _ => {
                             warn!("Unhandled query: {:?}", q);
-                        },
+                        }
                     }
                 }
             }
             _ => {
                 warn!("Unexpected message type: {:?}", msg.y);
-            },
+            }
         }
     }
 
@@ -276,7 +286,7 @@ impl Crawler {
                 .query(DhtQuery::Ping)
                 .build();
 
-            let res = self.send_message(&ping, node.address).await;
+            let _res = self.send_message(&ping, node.address).await;
         }
     }
 
@@ -291,7 +301,7 @@ impl Crawler {
                 Some(a) => {
                     let node = Node::new(NodeId(a.id), address);
                     self.insert_node(node).await;
-                },
+                }
                 None => {
                     warn!("No node id in response");
                 }
@@ -308,7 +318,10 @@ impl Crawler {
                 .query(DhtQuery::FindNode(NodeId(generate_random_node_id().into())))
                 .build();
 
-            let res = match self.send_request_and_wait_for_response(msg, node.address).await {
+            let res = match self
+                .send_request_and_wait_for_response(msg, node.address)
+                .await
+            {
                 Ok(res) => res,
                 Err(e) => {
                     error!("{}", e);
@@ -354,7 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let nodes = crawler.dht.lock().await.get_nodes();
     crawler.find_nodes(nodes).await;
-    
+
     loop {
         sleep(Duration::from_secs(1)).await;
     }
@@ -370,7 +383,7 @@ fn generate_random_node_id() -> [u8; 20] {
 }
 
 fn bytes_to_ipaddr(bytes: &[u8; 4]) -> Option<IpAddr> {
-    let addr = Ipv4Addr::from(bytes.clone());
+    let addr = Ipv4Addr::from(*bytes);
     Some(IpAddr::V4(addr))
 }
 
@@ -381,14 +394,16 @@ fn get_nodes(r: ReturnValues) -> Vec<Node> {
             nodes.chunks(26).for_each(|node| {
                 let node_id = NodeId(node[0..20].to_vec());
                 let addr = bytes_to_ipaddr(&<[u8; 4]>::try_from(&node[20..24]).unwrap()).unwrap();
-                let node_addr = SocketAddr::new(addr, u16::from_be_bytes(node[24..26].try_into().unwrap()));
+                let node_addr =
+                    SocketAddr::new(addr, u16::from_be_bytes(node[24..26].try_into().unwrap()));
                 nodes_list.push(Node::new(node_id, node_addr));
             });
         }
         (None, Some(values)) => {
             values.chunks(6).for_each(|value| {
                 let addr = bytes_to_ipaddr(&<[u8; 4]>::try_from(&value[0..4]).unwrap()).unwrap();
-                let node_addr = SocketAddr::new(addr, u16::from_be_bytes(value[4..6].try_into().unwrap()));
+                let node_addr =
+                    SocketAddr::new(addr, u16::from_be_bytes(value[4..6].try_into().unwrap()));
                 nodes_list.push(Node::new(NodeId(value[0..20].to_vec()), node_addr));
             });
         }

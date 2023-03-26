@@ -1,8 +1,8 @@
-use std::collections::{HashMap, BinaryHeap, VecDeque, BTreeMap};
+use std::cmp::Ordering;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Display;
 use std::net::SocketAddr;
-use std::cmp::Reverse;
-use std::cmp::Ordering;
 
 use rand::Rng;
 
@@ -40,7 +40,7 @@ enum NodeStatus {
 pub struct Node {
     pub id: NodeId,
     pub address: SocketAddr,
-    status: NodeStatus
+    status: NodeStatus,
 }
 
 impl Node {
@@ -111,7 +111,10 @@ impl DHT {
 
     pub fn insert(&mut self, node: Node) {
         let idx = self.bucket_index(&node.id.0);
-        let bucket = self.buckets.entry(idx).or_insert_with(|| KBucket::new(self.k));
+        let bucket = self
+            .buckets
+            .entry(idx)
+            .or_insert_with(|| KBucket::new(self.k));
         bucket.add_node(node);
     }
 
@@ -144,7 +147,12 @@ impl DHT {
         let mut closest_nodes = Vec::with_capacity(n);
         let idx = self.bucket_index(target_id);
 
-        for (_, bucket) in self.buckets.range(idx..).rev().chain(self.buckets.range(..idx).rev()) {
+        for (_, bucket) in self
+            .buckets
+            .range(idx..)
+            .rev()
+            .chain(self.buckets.range(..idx).rev())
+        {
             let bucket_nodes = bucket.find_closest_nodes(target_id, n);
             closest_nodes.extend(bucket_nodes);
 
@@ -156,12 +164,11 @@ impl DHT {
         closest_nodes.sort_by_key(|node| xor_distance(&node.id.0, target_id));
         closest_nodes.into_iter().take(n).collect()
     }
-    
 }
 
 impl Display for DHT {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (size, bucket) in self.buckets.iter() {
+        for (_size, bucket) in self.buckets.iter() {
             writeln!(f, "{:?}", bucket)?;
         }
         Ok(())
@@ -179,7 +186,7 @@ impl<'a> PartialEq for NodeDistance<'a> {
     }
 }
 
-impl<'a>  Eq for NodeDistance<'a> {}
+impl<'a> Eq for NodeDistance<'a> {}
 
 impl<'a> PartialOrd for NodeDistance<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -192,7 +199,6 @@ impl<'a> Ord for NodeDistance<'a> {
         self.distance.cmp(&other.distance)
     }
 }
-
 
 fn xor_distance(id1: &Vec<u8>, id2: &Vec<u8>) -> u128 {
     let mut distance: u128 = 0;
