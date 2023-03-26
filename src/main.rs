@@ -3,7 +3,6 @@ use clap::{App, Arg};
 use futures::FutureExt;
 use log::{error, trace, warn};
 use rand::Rng;
-use serde::{Deserialize, Serialize};
 
 use serde_bencode::{from_bytes, to_bytes};
 use std::collections::HashMap;
@@ -122,7 +121,7 @@ impl Crawler {
         socket.send_to(&encoded_msg, &addr).await?;
         Ok(())
     }
-    
+
     async fn send_request_and_wait_for_response(
         socket: Arc<tokio::net::UdpSocket>,
         pending_requests: PendingRequests,
@@ -135,14 +134,18 @@ impl Crawler {
                 return Err(format!("Error while sending message: {}", e).into());
             }
         };
-    
+
         let (response_sender, response_receiver) = oneshot::channel();
         let x = pending_requests
             .lock()
             .await
             .insert(request.t.clone(), response_sender);
         debug_assert!(x.is_none());
-        let response = match tokio::time::timeout(Duration::from_secs(WAIT_TIMEOUT), response_receiver).await 
+        let response = match tokio::time::timeout(
+            Duration::from_secs(WAIT_TIMEOUT),
+            response_receiver,
+        )
+        .await
         {
             Ok(Ok(response)) => response,
             Ok(Err(_)) | Err(_) => {
@@ -150,14 +153,14 @@ impl Crawler {
                 return Err(format!("Request timed out for {}:{}", addr.ip(), addr.port()).into());
             }
         };
-    
+
         trace!("Received response: {:?}", response);
-    
+
         pending_requests.lock().await.remove(&request.t.clone());
-    
+
         Ok(response)
     }
-    
+
     #[async_recursion]
     async fn find_nodes(
         socket: Arc<UdpSocket>,
@@ -174,7 +177,7 @@ impl Crawler {
                     .with_id(id_clone.0.clone())
                     .query(DhtQuery::FindNode(NodeId(generate_random_node_id().into())))
                     .build();
-    
+
                 let res = Self::send_request_and_wait_for_response(
                     socket_clone.clone(),
                     pending_requests_clone.clone(),
@@ -182,13 +185,18 @@ impl Crawler {
                     node.address,
                 )
                 .await;
-    
+
                 match res {
                     Ok(res) => {
                         if let Some(r) = res.r {
                             trace!("Found nodes: {:?}", r.nodes);
-                            Self::find_nodes(socket_clone, pending_requests_clone, id_clone, get_nodes(r))
-                                .await
+                            Self::find_nodes(
+                                socket_clone,
+                                pending_requests_clone,
+                                id_clone,
+                                get_nodes(r),
+                            )
+                            .await
                         } else {
                             warn!("No nodes found");
                         }
@@ -202,9 +210,12 @@ impl Crawler {
         }
     }
 
-    async fn process_responses(pending_requests: PendingRequests, socket: Arc<tokio::net::UdpSocket>) {
+    async fn process_responses(
+        pending_requests: PendingRequests,
+        socket: Arc<tokio::net::UdpSocket>,
+    ) {
         let mut buf = [0u8; 1024];
-    
+
         loop {
             let (size, _src) = socket.recv_from(&mut buf).await.unwrap();
             let msg = match from_bytes::<DhtMessage>(&buf[..size]) {
@@ -214,7 +225,7 @@ impl Crawler {
                     continue;
                 }
             };
-    
+
             trace!("waiting for lock");
             let mut pending_requests = pending_requests.lock().await;
             trace!("got lock");
@@ -228,7 +239,7 @@ impl Crawler {
             } else {
                 trace!("got message: {:?}", msg);
             }
-        
+
             drop(pending_requests);
         }
     }
@@ -236,21 +247,26 @@ impl Crawler {
     async fn run(&mut self, bootstrap_nodes: Vec<SocketAddr>) {
         let pending_requests_clone = self.pending_requests.clone();
         let socket_clone = self.socket.clone();
-    
+
         tokio::spawn(async move {
             Self::process_responses(pending_requests_clone, socket_clone).await;
         });
-    
+
         for node in bootstrap_nodes {
             self.introduce(node).await;
         }
-    
+
         let socket_clone = self.socket.clone();
         let pending_requests_clone = self.pending_requests.clone();
         let local_id_clone = self.local_id.clone();
-        Crawler::find_nodes(socket_clone, pending_requests_clone, local_id_clone, self.dht.lock().await.get_nodes()).await;
+        Crawler::find_nodes(
+            socket_clone,
+            pending_requests_clone,
+            local_id_clone,
+            self.dht.lock().await.get_nodes(),
+        )
+        .await;
     }
-    
 }
 
 fn generate_random_node_id() -> [u8; 20] {
@@ -295,10 +311,7 @@ async fn run(bootstrap_nodes: Vec<String>) -> Result<(), Box<dyn std::error::Err
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     let pending_requests = Arc::new(Mutex::new(HashMap::new()));
 
-    let mut crawler = Crawler::new(
-        socket.clone(),
-        pending_requests.clone(),
-    );
+    let mut crawler = Crawler::new(socket.clone(), pending_requests.clone());
 
     let mut parsed_nodes = vec![];
     for host in bootstrap_nodes {
