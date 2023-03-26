@@ -1,4 +1,5 @@
 use async_recursion::async_recursion;
+use clap::{App, Arg};
 use futures::FutureExt;
 use log::{error, trace, warn};
 use rand::Rng;
@@ -6,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use serde_bencode::{from_bytes, to_bytes};
 use std::collections::HashMap;
-use tokio::sync::{oneshot, Mutex, RwLock};
+
+use tokio::sync::{oneshot, Mutex};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -183,7 +185,7 @@ impl Crawler {
         let local_id = NodeId::new();
         Crawler {
             dht: Arc::new(Mutex::new(DHT::new(local_id.clone(), 20, 160))),
-            socket: socket,
+            socket,
             pending_requests,
             local_id,
         }
@@ -243,7 +245,13 @@ impl Crawler {
             .query(DhtQuery::Ping)
             .build();
 
-        let res = send_request_and_wait_for_response(self.socket.clone(), self.pending_requests.clone(), &ping, address).await;
+        let res = send_request_and_wait_for_response(
+            self.socket.clone(),
+            self.pending_requests.clone(),
+            &ping,
+            address,
+        )
+        .await;
         if let Ok(msg) = res {
             match msg.r {
                 Some(r) => {
@@ -314,7 +322,7 @@ async fn send_request_and_wait_for_response(
     request: &DhtMessage,
     addr: SocketAddr,
 ) -> Result<DhtMessage, Box<dyn std::error::Error + std::marker::Send + Sync>> {
-    send_message(socket, &request, addr).await?;
+    send_message(socket, request, addr).await?;
 
     let (response_sender, response_receiver) = oneshot::channel();
     let x = pending_requests
@@ -322,30 +330,28 @@ async fn send_request_and_wait_for_response(
         .await
         .insert(request.t.clone(), response_sender);
     debug_assert!(x.is_none());
-    let response = match tokio::time::timeout(Duration::from_secs(5), response_receiver).await?
-    {
+    let response = match tokio::time::timeout(Duration::from_secs(5), response_receiver).await? {
         Ok(response) => response,
         Err(_) => {
-            pending_requests
-                .lock()
-                .await
-                .remove(&request.t.clone());
+            pending_requests.lock().await.remove(&request.t.clone());
             return Err("Request timed out".into());
         }
     };
 
     trace!("Received response: {:?}", response);
-    
-    pending_requests
-        .lock()
-        .await
-        .remove(&request.t.clone());
+
+    pending_requests.lock().await.remove(&request.t.clone());
 
     Ok(response)
 }
 
 #[async_recursion]
-async fn find_nodes(id: NodeId, socket: Arc<tokio::net::UdpSocket>, pending_requests: PendingRequests, nodes: Vec<Node>) {
+async fn find_nodes(
+    id: NodeId,
+    socket: Arc<tokio::net::UdpSocket>,
+    pending_requests: PendingRequests,
+    nodes: Vec<Node>,
+) {
     for node in nodes {
         trace!("Finding nodes for: {:?}", node);
 
@@ -359,15 +365,21 @@ async fn find_nodes(id: NodeId, socket: Arc<tokio::net::UdpSocket>, pending_requ
                 .build();
 
             let res = {
-                send_request_and_wait_for_response(socket_clone.clone(), pending_requests_clone.clone(), &msg, node.address)
-                    .await
+                send_request_and_wait_for_response(
+                    socket_clone.clone(),
+                    pending_requests_clone.clone(),
+                    &msg,
+                    node.address,
+                )
+                .await
             };
-    
+
             match res {
                 Ok(res) => {
                     if let Some(r) = res.r {
                         trace!("Found nodes: {:?}", r.nodes);
-                        find_nodes(id_clone, socket_clone, pending_requests_clone, get_nodes(r)).await
+                        find_nodes(id_clone, socket_clone, pending_requests_clone, get_nodes(r))
+                            .await
                     } else {
                         warn!("No nodes found");
                     }
@@ -376,7 +388,6 @@ async fn find_nodes(id: NodeId, socket: Arc<tokio::net::UdpSocket>, pending_requ
                     error!("{}", e);
                 }
             };
-
         });
     }
 }
@@ -385,7 +396,7 @@ async fn process_responses(pending_requests: PendingRequests, socket: Arc<tokio:
     let mut buf = [0u8; 1024];
 
     loop {
-        let (size, src) = socket.recv_from(&mut buf).await.unwrap();
+        let (size, _src) = socket.recv_from(&mut buf).await.unwrap();
         let msg = match from_bytes::<DhtMessage>(&buf[..size]) {
             Ok(msg) => msg,
             Err(e) => {
@@ -396,9 +407,9 @@ async fn process_responses(pending_requests: PendingRequests, socket: Arc<tokio:
 
         let mut pending_requests = pending_requests.lock().await;
         if let Some(response_sender) = pending_requests.remove(&msg.t) {
-            debug_assert!(response_sender.is_closed() == false);
+            debug_assert!(!response_sender.is_closed());
             let res = response_sender.send(msg);
-            if let Err(e) = res {
+            if let Err(_e) = res {
                 error!("unable to send message to oneshot");
             }
         } else {
@@ -410,20 +421,14 @@ async fn process_responses(pending_requests: PendingRequests, socket: Arc<tokio:
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Trace)
-        .init();
-
+async fn run(bootstrap_nodes: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     let pending_requests = Arc::new(Mutex::new(HashMap::new()));
-    let bootstrap_nodes = vec![
-        "router.utorrent.com:6881",
-        "router.bittorrent.com:6881",
-        "dht.transmissionbt.com:6881",
-    ];
 
-    let crawler = Arc::new(Mutex::new(Crawler::new(socket.clone(), pending_requests.clone())));
+    let crawler = Arc::new(Mutex::new(Crawler::new(
+        socket.clone(),
+        pending_requests.clone(),
+    )));
     let local_id = crawler.lock().await.local_id.clone();
     let pending_requests_clone = pending_requests.clone();
     let socket_clone = socket.clone();
@@ -453,4 +458,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn main() {
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Trace)
+        .init();
+
+    let matches = App::new("DHT-Crawler CLI")
+        .version("1.0")
+        .about("A CLI to handle node lists")
+        .arg(
+            Arg::with_name("bootstrap nodes")
+                .short('b')
+                .long("bootstrap")
+                .value_name("BOOTSTRAP")
+                .help("List of bootstrap nodes in IP:PORT format, separated by commas")
+                .takes_value(true),
+        )
+        .get_matches();
+
+    let bootstrap_nodes = matches
+        .value_of("bootstrap nodes")
+        .unwrap_or("router.bittorrent.com:6881,router.utorrent.com:6881");
+    let nodes: Vec<String> = bootstrap_nodes
+        .split(',')
+        .map(|s| s.parse::<String>().unwrap())
+        .collect();
+
+    println!("Nodes: {:?}", nodes);
+
+    run(nodes).unwrap();
 }
