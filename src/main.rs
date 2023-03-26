@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use serde_bencode::{from_bytes, to_bytes};
 use std::collections::HashMap;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, RwLock};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -57,7 +57,7 @@ pub struct DhtMessage {
 impl DhtMessage {
     pub fn new(_type: MessageType) -> Self {
         let mut rng = rand::thread_rng();
-        let t: Vec<u8> = (0..2).map(|_| rng.gen_range(0..=255)).collect();
+        let t: Vec<u8> = (0..6).map(|_| rng.gen_range(0..=255)).collect();
 
         DhtMessage {
             t,
@@ -69,33 +69,41 @@ impl DhtMessage {
         }
     }
 
-    // pub fn with_transaction_id(mut self) -> Self {
-    //     let mut rng = rand::thread_rng();
-    //     let t: Vec<u8> = (0..2)
-    //         .map(|_| rng.gen_range(0..=255))
-    //         .collect();
-    //     self.t = Some(t);
-    //     self
-    // }
+    pub fn with_id(mut self, id: Vec<u8>) -> Self {
+        let id_clone = id.clone();
+        self.a = self.a.map_or_else(
+            || {
+                let mut a = Args::default();
+                a.id = id_clone;
+                Some(a)
+            },
+            |mut a| {
+                a.id = id;
+                Some(a)
+            },
+        );
+        self
+    }
 
     pub fn query(mut self, q: DhtQuery) -> Self {
         match q {
             DhtQuery::Ping => {
                 self.q = Some("ping".to_string());
-                self.a = Some({
-                    let mut a = Args::default();
-                    a.id = "abcdefghij0123456789".as_bytes().to_vec();
-                    a
-                })
             }
             DhtQuery::FindNode(node) => {
                 self.q = Some("find_node".to_string());
-                self.a = Some({
-                    let mut a = Args::default();
-                    a.id = "abcdefghij0123456789".as_bytes().to_vec();
-                    a.target = Some(node.0);
-                    a
-                })
+                let id_clone = node.0.clone();
+                self.a = self.a.map_or_else(
+                    || {
+                        let mut a = Args::default();
+                        a.target = Some(id_clone);
+                        Some(a)
+                    },
+                    |mut a| {
+                        a.target = Some(node.0);
+                        Some(a)
+                    },
+                );
             }
             DhtQuery::GetPeers(_) => self.q = Some("get_peers".to_string()),
             DhtQuery::AnnouncePeer(_, _, _) => self.q = Some("announce_peer".to_string()),
@@ -171,75 +179,13 @@ struct Crawler {
 }
 
 impl Crawler {
-    fn new(socket: UdpSocket) -> Self {
+    fn new(socket: Arc<tokio::net::UdpSocket>, pending_requests: PendingRequests) -> Self {
         let local_id = NodeId::new();
         Crawler {
             dht: Arc::new(Mutex::new(DHT::new(local_id.clone(), 20, 160))),
-            socket: Arc::new(socket),
-            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            socket: socket,
+            pending_requests,
             local_id,
-        }
-    }
-
-    async fn send_message(
-        &mut self,
-        message: &DhtMessage,
-        addr: SocketAddr,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let encoded_msg = to_bytes(&message).unwrap();
-        self.socket.send_to(&encoded_msg, &addr).await?;
-        Ok(())
-    }
-
-    async fn send_request_and_wait_for_response(
-        &mut self,
-        request: DhtMessage,
-        addr: SocketAddr,
-    ) -> Result<DhtMessage, Box<dyn std::error::Error>> {
-        self.send_message(&request, addr).await?;
-
-        let (response_sender, response_receiver) = oneshot::channel();
-        self.pending_requests
-            .lock()
-            .await
-            .insert(request.t.clone(), response_sender);
-        let response = match tokio::time::timeout(Duration::from_secs(5), response_receiver).await?
-        {
-            Ok(response) => response,
-            Err(_) => {
-                self.pending_requests
-                    .lock()
-                    .await
-                    .remove(&request.t.clone());
-                return Err("Request timed out".into());
-            }
-        };
-        self.pending_requests
-            .lock()
-            .await
-            .remove(&request.t.clone());
-
-        Ok(response)
-    }
-
-    async fn process_responses(&self) {
-        let mut buf = [0u8; 1024];
-
-        loop {
-            let (size, src) = self.socket.recv_from(&mut buf).await.unwrap();
-            let msg = match from_bytes::<DhtMessage>(&buf[..size]) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    error!("{}", e);
-                    continue;
-                }
-            };
-
-            if let Some(response_sender) = self.pending_requests.lock().await.remove(&msg.t) {
-                let _ = response_sender.send(msg);
-            } else {
-                self.handle_message(msg, src).await;
-            }
         }
     }
 
@@ -248,6 +194,7 @@ impl Crawler {
     }
 
     async fn handle_message(&self, msg: DhtMessage, origin: SocketAddr) {
+        trace!("Received message: {:?}", msg);
         match msg.y {
             MessageType::Response => {
                 if let Some(r) = msg.r {
@@ -286,93 +233,32 @@ impl Crawler {
                 .query(DhtQuery::Ping)
                 .build();
 
-            let _res = self.send_message(&ping, node.address).await;
+            let _res = send_message(self.socket.clone(), &ping, node.address).await;
         }
     }
 
     async fn introduce(&mut self, address: SocketAddr) {
         let ping = DhtMessage::new(MessageType::Query)
+            .with_id(self.local_id.clone().0)
             .query(DhtQuery::Ping)
             .build();
 
-        let res = self.send_request_and_wait_for_response(ping, address).await;
+        let res = send_request_and_wait_for_response(self.socket.clone(), self.pending_requests.clone(), &ping, address).await;
         if let Ok(msg) = res {
-            match msg.a {
-                Some(a) => {
-                    let node = Node::new(NodeId(a.id), address);
+            match msg.r {
+                Some(r) => {
+                    let node = Node::new(NodeId(r.id), address);
+                    trace!("adding node: {:?}", node);
                     self.insert_node(node).await;
                 }
                 None => {
-                    warn!("No node id in response");
+                    warn!("No node id in response {:?}", msg);
                 }
             }
-            let node = Node::new(self.local_id.clone(), address);
-            self.insert_node(node).await;
+        } else {
+            warn!("Error while sending ping: {:?}", res);
         }
     }
-
-    #[async_recursion]
-    async fn find_nodes(&mut self, nodes: Vec<Node>) {
-        for node in nodes {
-            let msg = DhtMessage::new(MessageType::Query)
-                .query(DhtQuery::FindNode(NodeId(generate_random_node_id().into())))
-                .build();
-
-            let res = match self
-                .send_request_and_wait_for_response(msg, node.address)
-                .await
-            {
-                Ok(res) => res,
-                Err(e) => {
-                    error!("{}", e);
-                    continue;
-                }
-            };
-
-            if let Some(r) = res.r {
-                let nodes = get_nodes(r);
-                trace!("Found {:?}", nodes);
-                self.find_nodes(nodes).await;
-            }
-        }
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Trace)
-        .init();
-
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let bootstrap_nodes = vec![
-        "router.utorrent.com:6881",
-        "router.bittorrent.com:6881",
-        "dht.transmissionbt.com:6881",
-    ];
-
-    let mut crawler = Crawler::new(socket);
-
-    let crawler_clone = crawler.clone();
-    tokio::spawn(async move {
-        crawler_clone.process_responses().await;
-    });
-
-    for host in bootstrap_nodes {
-        let addrs = lookup_host(host).await?;
-        for address in addrs {
-            crawler.introduce(address).await;
-        }
-    }
-
-    let nodes = crawler.dht.lock().await.get_nodes();
-    crawler.find_nodes(nodes).await;
-
-    loop {
-        sleep(Duration::from_secs(1)).await;
-    }
-
-    Ok(())
 }
 
 fn generate_random_node_id() -> [u8; 20] {
@@ -410,4 +296,161 @@ fn get_nodes(r: ReturnValues) -> Vec<Node> {
         _ => (),
     }
     nodes_list
+}
+
+async fn send_message(
+    socket: Arc<tokio::net::UdpSocket>,
+    message: &DhtMessage,
+    addr: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error + std::marker::Send + Sync>> {
+    let encoded_msg = to_bytes(&message).unwrap();
+    socket.send_to(&encoded_msg, &addr).await?;
+    Ok(())
+}
+
+async fn send_request_and_wait_for_response(
+    socket: Arc<tokio::net::UdpSocket>,
+    pending_requests: PendingRequests,
+    request: &DhtMessage,
+    addr: SocketAddr,
+) -> Result<DhtMessage, Box<dyn std::error::Error + std::marker::Send + Sync>> {
+    send_message(socket, &request, addr).await?;
+
+    let (response_sender, response_receiver) = oneshot::channel();
+    let x = pending_requests
+        .lock()
+        .await
+        .insert(request.t.clone(), response_sender);
+    debug_assert!(x.is_none());
+    let response = match tokio::time::timeout(Duration::from_secs(5), response_receiver).await?
+    {
+        Ok(response) => response,
+        Err(_) => {
+            pending_requests
+                .lock()
+                .await
+                .remove(&request.t.clone());
+            return Err("Request timed out".into());
+        }
+    };
+
+    trace!("Received response: {:?}", response);
+    
+    pending_requests
+        .lock()
+        .await
+        .remove(&request.t.clone());
+
+    Ok(response)
+}
+
+#[async_recursion]
+async fn find_nodes(id: NodeId, socket: Arc<tokio::net::UdpSocket>, pending_requests: PendingRequests, nodes: Vec<Node>) {
+    for node in nodes {
+        trace!("Finding nodes for: {:?}", node);
+
+        let socket_clone = socket.clone();
+        let pending_requests_clone = pending_requests.clone();
+        let id_clone = id.clone();
+        tokio::spawn(async move {
+            let msg = DhtMessage::new(MessageType::Query)
+                .with_id(id_clone.0.clone())
+                .query(DhtQuery::FindNode(NodeId(generate_random_node_id().into())))
+                .build();
+
+            let res = {
+                send_request_and_wait_for_response(socket_clone.clone(), pending_requests_clone.clone(), &msg, node.address)
+                    .await
+            };
+    
+            match res {
+                Ok(res) => {
+                    if let Some(r) = res.r {
+                        trace!("Found nodes: {:?}", r.nodes);
+                        find_nodes(id_clone, socket_clone, pending_requests_clone, get_nodes(r)).await
+                    } else {
+                        warn!("No nodes found");
+                    }
+                }
+                Err(e) => {
+                    error!("{}", e);
+                }
+            };
+
+        });
+    }
+}
+
+async fn process_responses(pending_requests: PendingRequests, socket: Arc<tokio::net::UdpSocket>) {
+    let mut buf = [0u8; 1024];
+
+    loop {
+        let (size, src) = socket.recv_from(&mut buf).await.unwrap();
+        let msg = match from_bytes::<DhtMessage>(&buf[..size]) {
+            Ok(msg) => msg,
+            Err(e) => {
+                error!("{}", e);
+                continue;
+            }
+        };
+
+        let mut pending_requests = pending_requests.lock().await;
+        if let Some(response_sender) = pending_requests.remove(&msg.t) {
+            debug_assert!(response_sender.is_closed() == false);
+            let res = response_sender.send(msg);
+            if let Err(e) = res {
+                error!("unable to send message to oneshot");
+            }
+        } else {
+            trace!("got query: {:?}", msg);
+        }
+
+        drop(pending_requests);
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Trace)
+        .init();
+
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+    let bootstrap_nodes = vec![
+        "router.utorrent.com:6881",
+        "router.bittorrent.com:6881",
+        "dht.transmissionbt.com:6881",
+    ];
+
+    let crawler = Arc::new(Mutex::new(Crawler::new(socket.clone(), pending_requests.clone())));
+    let local_id = crawler.lock().await.local_id.clone();
+    let pending_requests_clone = pending_requests.clone();
+    let socket_clone = socket.clone();
+    tokio::spawn(async move {
+        process_responses(pending_requests_clone, socket_clone).await;
+    });
+
+    for host in bootstrap_nodes {
+        let addrs = lookup_host(host).await?;
+        for address in addrs {
+            crawler.lock().await.introduce(address).await;
+            trace!("Introduced to: {:?}", address);
+        }
+    }
+
+    let crawler_clone = crawler.clone();
+    let pending_requests = pending_requests.clone();
+    let socket = socket.clone();
+    tokio::spawn(async move {
+        let nodes = crawler_clone.lock().await.dht.lock().await.get_nodes();
+        trace!("Found nodes: {:?}", nodes);
+        find_nodes(local_id, socket, pending_requests, nodes).await;
+    });
+
+    loop {
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    Ok(())
 }
