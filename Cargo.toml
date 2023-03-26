@@ -1,5 +1,5 @@
 [package]
-name = "torrent"
+name = "dht-crawler"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,7 +9,15 @@ edition = "2021"
 tokio = { version = "1.17.0", features = ["full"] }
 sha-1 = "0.10.0"
 serde_bencode = "^0.2.3"
-serde = "^1.0.0"
+serde =  { version = "^1.0.0", features = ["derive"] }
 serde_derive = "^1.0.0"
-serde_bytes = "0.11"
 byteorder = "1.4.3"
+rand = "0.8.5"
+hex = "0.4.3"
+num-bigint = "0.4.3"
+serde_json = "1.0"
+serde_bytes = "0.11.9"
+futures = "0.3.27"
+async-recursion = "1.0.4"
+env_logger = "0.10.0"
+log = "0.4.0"
